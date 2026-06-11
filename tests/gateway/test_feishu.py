@@ -4968,12 +4968,15 @@ class TestBuildTableCardPayload(unittest.TestCase):
         self.assertEqual(card["config"]["wide_screen_mode"], True)
         self.assertEqual(card["header"]["template"], "blue")
         self.assertIn("📊", card["header"]["title"]["content"])
-        self.assertEqual(len(card["elements"]), 1)
-        self.assertEqual(card["elements"][0]["tag"], "markdown")
-        md = card["elements"][0]["content"]
-        self.assertIn("| Name | Age |", md)
-        self.assertIn("| Alice | 30 |", md)
-        self.assertIn("| Bob | 25 |", md)
+        elements = card["body"]["elements"]
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0]["tag"], "table")
+        # Verify table structure
+        col_names = [c["display_name"] for c in elements[0]["columns"]]
+        self.assertEqual(col_names, ["Name", "Age"])
+        self.assertEqual(len(elements[0]["rows"]), 2)
+        self.assertEqual(elements[0]["rows"][0]["col0"], "Alice")
+        self.assertEqual(elements[0]["rows"][1]["col1"], "25")
 
     # -- mixed text + table -----------------------------------------------
 
@@ -4986,13 +4989,14 @@ class TestBuildTableCardPayload(unittest.TestCase):
             "End of report."
         )
         card = self._parse_card(content)
-        elements = card["elements"]
+        elements = card["body"]["elements"]
         # Should have: text-before, table, text-after
         self.assertEqual(len(elements), 3)
         self.assertEqual(elements[0]["tag"], "markdown")
         self.assertIn("Here is the report", elements[0]["content"])
-        self.assertEqual(elements[1]["tag"], "markdown")
-        self.assertIn("| Col |", elements[1]["content"])
+        self.assertEqual(elements[1]["tag"], "table")
+        self.assertEqual(elements[1]["columns"][0]["display_name"], "Col")
+        self.assertEqual(elements[1]["rows"][0]["col0"], "val")
         self.assertEqual(elements[2]["tag"], "markdown")
         self.assertIn("End of report", elements[2]["content"])
 
@@ -5005,12 +5009,17 @@ class TestBuildTableCardPayload(unittest.TestCase):
             "| B |\n| --- |\n| 2 |"
         )
         card = self._parse_card(content)
-        elements = card["elements"]
+        elements = card["body"]["elements"]
         # table1, text, table2
         self.assertEqual(len(elements), 3)
-        self.assertIn("| A |", elements[0]["content"])
+        self.assertEqual(elements[0]["tag"], "table")
+        self.assertEqual(elements[0]["columns"][0]["display_name"], "A")
+        self.assertEqual(elements[0]["rows"][0]["col0"], "1")
+        self.assertEqual(elements[1]["tag"], "markdown")
         self.assertIn("Some text", elements[1]["content"])
-        self.assertIn("| B |", elements[2]["content"])
+        self.assertEqual(elements[2]["tag"], "table")
+        self.assertEqual(elements[2]["columns"][0]["display_name"], "B")
+        self.assertEqual(elements[2]["rows"][0]["col0"], "2")
 
     # -- large table truncation -------------------------------------------
 
@@ -5018,19 +5027,17 @@ class TestBuildTableCardPayload(unittest.TestCase):
         rows = "\n".join(f"| row{i} |" for i in range(80))
         content = f"| Id |\n| --- |\n{rows}"
         card = self._parse_card(content)
-        elements = card["elements"]
+        elements = card["body"]["elements"]
         # table + truncation note
         self.assertTrue(len(elements) >= 2)
-        table_md = elements[0]["content"]
-        # Count data rows (lines excluding header and separator)
-        data_lines = [
-            ln for ln in table_md.split("\n")
-            if ln.startswith("|") and not ln.startswith("| Id") and not ln.startswith("| ---")
-        ]
-        self.assertEqual(len(data_lines), 50)
+        table_elem = elements[0]
+        self.assertEqual(table_elem["tag"], "table")
+        # Native table component has rows directly.
+        self.assertEqual(len(table_elem["rows"]), 50)
         # Truncation warning
-        last = elements[-1]["content"]
-        self.assertIn("截断", last)
+        last = elements[-1]
+        self.assertEqual(last["tag"], "markdown")
+        self.assertIn("truncated", last["content"])
 
     # -- malformed table falls back ---------------------------------------
 
@@ -5042,7 +5049,7 @@ class TestBuildTableCardPayload(unittest.TestCase):
         # _build_table_card_payload still returns a valid card (text-only).
         result = _build_table_card_payload("| just a pipe line |\nnot a table")
         card = json.loads(result)
-        self.assertEqual(card["elements"][0]["tag"], "markdown")
+        self.assertEqual(card["body"]["elements"][0]["tag"], "markdown")
 
     def test_empty_content_returns_none(self):
         from gateway.platforms.feishu import _build_table_card_payload
@@ -5061,10 +5068,13 @@ class TestBuildTableCardPayload(unittest.TestCase):
     def test_alignment_markers_are_replaced(self):
         table = "| L | C | R |\n| :--- | :---: | ---: |\n| a | b | c |"
         card = self._parse_card(table)
-        md = card["elements"][0]["content"]
-        self.assertNotIn(":---", md)
-        self.assertNotIn("---:", md)
-        self.assertIn("---", md)
+        elem = card["body"]["elements"][0]
+        self.assertEqual(elem["tag"], "table")
+        # Alignment markers are stripped; column names are clean.
+        col_names = [c["display_name"] for c in elem["columns"]]
+        self.assertEqual(col_names, ["L", "C", "R"])
+        # Row data should contain the values, not alignment markers.
+        self.assertEqual(elem["rows"][0], {"col0": "a", "col1": "b", "col2": "c"})
 
     # -- _build_outbound_payload integration ------------------------------
 
