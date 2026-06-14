@@ -1939,7 +1939,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
-        self.session_store = SessionStore(
+        from gateway.extensions.session_fallback import install_fallback
+        _SessionStore = install_fallback(SessionStore)
+        self.session_store = _SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )

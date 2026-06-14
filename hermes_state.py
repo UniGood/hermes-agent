@@ -1599,6 +1599,30 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_active_session_by_source(
+        self, source: str, user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """查找指定 source + user_id 的活跃 session（ended_at IS NULL）。
+
+        用于 Gateway SessionStore 的 state.db fallback：
+        当 _entries 内存中找不到 session 时，从 state.db 查询 API Server
+        创建的 session 记录，避免 session 分裂。
+
+        返回最新的一条（started_at DESC），如果没有活跃 session 返回 None。
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id, source, user_id, started_at, ended_at, title "
+                "FROM sessions "
+                "WHERE source = ? AND user_id = ? AND ended_at IS NULL "
+                "ORDER BY started_at DESC LIMIT 1",
+                (source, user_id),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row) if not isinstance(row, dict) else row
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
