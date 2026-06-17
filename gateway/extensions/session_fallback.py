@@ -85,13 +85,13 @@ def _make_fallback_mixin(Base: Type) -> Type:
 
             db_session_id = db_session["id"]
 
-            # 如果内存中已有 entry，检查是否需要替换
+            # 如果内存中已有 entry，检查 session_id 是否一致
             if session_key in self._entries:
                 entry = self._entries[session_key]
-                # 没过期且 session_id 一致 → 不需要替换
-                if not self._is_session_expired(entry) and entry.session_id == db_session_id:
+                # session_id 一致 → 不需要替换，让 _should_reset 处理过期逻辑
+                if entry.session_id == db_session_id:
                     return
-                # 过期了或 session_id 不一致 → 需要替换
+                # session_id 不一致 → 需要替换（state.db 被外部修改）
                 logger.info(
                     "[session_fallback] Memory entry outdated: "
                     "mem_session_id=%s db_session_id=%s expired=%s",
