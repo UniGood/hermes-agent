@@ -49,7 +49,16 @@ def _make_fallback_mixin(Base: Type) -> Type:
             return super().get_or_create_session(source, force_new=force_new)
 
         def _inject_from_db_if_needed(self, source):
-            """如果 _entries 中没有此 session，尝试从 state.db 加载。"""
+            """检查 state.db 是否有更新的活跃 session，必要时注入 _entries。
+
+            解决的问题：hermes-active 等外部系统可能直接修改了 state.db
+            （标记旧 session ended、创建新 session），但 Gateway 内存中的
+            entry.updated_at 被消息刷新过，_is_session_expired 返回 False，
+            导致 Gateway 继续使用旧 session。
+
+            修复：即使 _is_session_expired 返回 False，也查 state.db 对比
+            session_id。如果不一致，说明 state.db 被外部修改了，替换内存中的 entry。
+            """
             from gateway.session import build_session_key
 
             session_key = build_session_key(
@@ -62,11 +71,7 @@ def _make_fallback_mixin(Base: Type) -> Type:
                 ),
             )
 
-            # 已在内存中，无需 fallback
-            if session_key in self._entries:
-                return
-
-            # 查 state.db
+            # 查 state.db 当前活跃 session
             platform_value = source.platform.value
             user_id = source.user_id
             if not user_id:
@@ -78,10 +83,25 @@ def _make_fallback_mixin(Base: Type) -> Type:
             if db_session is None:
                 return
 
-            # 找到了！注入 _entries
+            db_session_id = db_session["id"]
+
+            # 如果内存中已有 entry，检查是否需要替换
+            if session_key in self._entries:
+                entry = self._entries[session_key]
+                # 没过期且 session_id 一致 → 不需要替换
+                if not self._is_session_expired(entry) and entry.session_id == db_session_id:
+                    return
+                # 过期了或 session_id 不一致 → 需要替换
+                logger.info(
+                    "[session_fallback] Memory entry outdated: "
+                    "mem_session_id=%s db_session_id=%s expired=%s",
+                    entry.session_id, db_session_id,
+                    self._is_session_expired(entry),
+                )
+
+            # 注入新的 session entry
             from gateway.session import SessionEntry, _now
 
-            db_session_id = db_session["id"]
             db_started_at = db_session.get("started_at")
             now = _now()
 
@@ -101,17 +121,15 @@ def _make_fallback_mixin(Base: Type) -> Type:
                 chat_type=source.chat_type,
             )
 
-            # 加锁注入
+            # 加锁注入（替换旧 entry）
             with self._lock:
-                # 双重检查（另一个线程可能已经注入了）
-                if session_key not in self._entries:
-                    self._entries[session_key] = entry
-                    self._save()
-                    logger.info(
-                        "[session_fallback] Injected session %s from state.db "
-                        "for key=%s source=%s user_id=%s",
-                        db_session_id, session_key, platform_value, user_id,
-                    )
+                self._entries[session_key] = entry
+                self._save()
+                logger.info(
+                    "[session_fallback] Injected session %s from state.db "
+                    "for key=%s source=%s user_id=%s",
+                    db_session_id, session_key, platform_value, user_id,
+                )
 
     FallbackSessionStore.__name__ = Base.__name__ + "WithFallback"
     FallbackSessionStore.__qualname__ = Base.__qualname__ + "WithFallback"
