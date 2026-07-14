@@ -23,6 +23,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _build_embedded_profile_env,
     _normalize_retain_tags,
+    _parse_float_setting,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
@@ -151,6 +152,42 @@ def test_normalize_retain_tags_accepts_csv_and_dedupes():
 def test_normalize_retain_tags_accepts_json_array_string():
     value = json.dumps(["agent:fakeassistantname", "source_system:hermes-agent"])
     assert _normalize_retain_tags(value) == ["agent:fakeassistantname", "source_system:hermes-agent"]
+
+
+# ---------------------------------------------------------------------------
+# _parse_float_setting tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseFloatSetting:
+    """Validate guarded float parsing mirrors _parse_float_setting contract."""
+
+    def test_valid_float(self):
+        assert _parse_float_setting(3.5, 5.0) == 3.5
+
+    def test_valid_string(self):
+        assert _parse_float_setting("2.5", 5.0) == 2.5
+
+    def test_valid_int(self):
+        assert _parse_float_setting(3, 5.0) == 3.0
+
+    def test_zero_is_valid(self):
+        assert _parse_float_setting(0, 5.0) == 0.0
+
+    def test_none_returns_default(self):
+        assert _parse_float_setting(None, 5.0) == 5.0
+
+    def test_empty_string_returns_default(self):
+        assert _parse_float_setting("", 5.0) == 5.0
+
+    def test_invalid_string_returns_default(self):
+        assert _parse_float_setting("not-a-number", 5.0) == 5.0
+
+    def test_negative_returns_default(self):
+        assert _parse_float_setting(-1.0, 5.0) == 5.0
+
+    def test_negative_string_returns_default(self):
+        assert _parse_float_setting("-3", 5.0) == 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1122,86 @@ class TestSessionSwitchBufferFlush:
 
         assert finished.is_set(), "switch returned before prefetch thread settled"
         assert provider._prefetch_result == ""
+
+    def test_prefetch_join_timeout_default(self, provider_with_config):
+        """Default prefetch_join_timeout should be 5.0."""
+        p = provider_with_config()
+        assert p._prefetch_join_timeout == 5.0
+
+    def test_prefetch_join_timeout_from_config(self, provider_with_config):
+        """Config value should be respected."""
+        p = provider_with_config(prefetch_join_timeout=10.0)
+        assert p._prefetch_join_timeout == 10.0
+
+    def test_prefetch_join_timeout_zero(self, provider_with_config):
+        """Zero is a valid non-blocking timeout."""
+        p = provider_with_config(prefetch_join_timeout=0)
+        assert p._prefetch_join_timeout == 0.0
+
+    def test_prefetch_join_timeout_invalid_uses_default(self, provider_with_config):
+        """Invalid config value should fall back to default."""
+        p = provider_with_config(prefetch_join_timeout="garbage")
+        assert p._prefetch_join_timeout == 5.0
+
+    def test_prefetch_join_timeout_negative_uses_default(self, provider_with_config):
+        """Negative value should fall back to default."""
+        p = provider_with_config(prefetch_join_timeout=-5)
+        assert p._prefetch_join_timeout == 5.0
+
+    def test_prefetch_uses_configured_timeout(self, provider_with_config):
+        """prefetch() join should use the configured timeout."""
+        import threading
+
+        p = provider_with_config(prefetch_join_timeout=0.1)
+        gate = threading.Event()
+
+        def _slow():
+            gate.wait(timeout=5.0)
+
+        p._prefetch_thread = threading.Thread(target=_slow, daemon=True)
+        p._prefetch_thread.start()
+
+        # prefetch should return quickly with timeout=0.1
+        result = p.prefetch("test")
+        gate.set()  # release thread
+        # Result is empty because thread didn't finish in 0.1s
+        assert result == ""
+
+    def test_session_switch_uses_configured_timeout(self, provider_with_config):
+        """on_session_switch join should use the configured timeout."""
+        import threading
+
+        p = provider_with_config(prefetch_join_timeout=0.1)
+        gate = threading.Event()
+
+        def _slow():
+            gate.wait(timeout=5.0)
+
+        p._prefetch_thread = threading.Thread(target=_slow, daemon=True)
+        p._prefetch_thread.start()
+
+        # on_session_switch should return quickly with timeout=0.1
+        p.on_session_switch("new-sid")
+        gate.set()  # release thread
+        assert p._prefetch_result == ""
+
+    def test_shutdown_uses_configured_timeout(self, provider_with_config):
+        """shutdown() join should use the configured timeout."""
+        import threading
+
+        p = provider_with_config(prefetch_join_timeout=0.1)
+        gate = threading.Event()
+
+        def _slow():
+            gate.wait(timeout=5.0)
+
+        p._prefetch_thread = threading.Thread(target=_slow, daemon=True)
+        p._prefetch_thread.start()
+
+        # shutdown should return quickly with timeout=0.1
+        p._client.aclose = AsyncMock()
+        p.shutdown()
+        gate.set()  # release thread
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
         self, provider_with_config
