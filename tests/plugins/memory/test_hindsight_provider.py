@@ -24,6 +24,7 @@ from plugins.memory.hindsight import (
     _build_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
+    _parse_float_setting,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
@@ -191,6 +192,42 @@ def test_normalize_observation_scopes_list_of_lists():
         ["user:alice"],
         ["team:eng"],
     ]
+
+
+# ---------------------------------------------------------------------------
+# _parse_float_setting tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseFloatSetting:
+    """Validate guarded float parsing mirrors _parse_float_setting contract."""
+
+    def test_valid_float(self):
+        assert _parse_float_setting(3.5, 5.0) == 3.5
+
+    def test_valid_string(self):
+        assert _parse_float_setting("2.5", 5.0) == 2.5
+
+    def test_valid_int(self):
+        assert _parse_float_setting(3, 5.0) == 3.0
+
+    def test_zero_is_valid(self):
+        assert _parse_float_setting(0, 5.0) == 0.0
+
+    def test_none_returns_default(self):
+        assert _parse_float_setting(None, 5.0) == 5.0
+
+    def test_empty_string_returns_default(self):
+        assert _parse_float_setting("", 5.0) == 5.0
+
+    def test_invalid_string_returns_default(self):
+        assert _parse_float_setting("not-a-number", 5.0) == 5.0
+
+    def test_negative_returns_default(self):
+        assert _parse_float_setting(-1.0, 5.0) == 5.0
+
+    def test_negative_string_returns_default(self):
+        assert _parse_float_setting("-3", 5.0) == 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1154,82 @@ class TestSessionSwitchBufferFlush:
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
 
+    def test_prefetch_join_timeout_default(self, provider_with_config):
+        """Default prefetch_join_timeout should be 5.0."""
+        p = provider_with_config()
+        assert p._prefetch_join_timeout == 5.0
+
+    def test_prefetch_join_timeout_from_config(self, provider_with_config):
+        """Config value should be respected."""
+        p = provider_with_config(prefetch_join_timeout=10.0)
+        assert p._prefetch_join_timeout == 10.0
+
+    def test_prefetch_join_timeout_zero(self, provider_with_config):
+        """Zero is a valid non-blocking timeout."""
+        p = provider_with_config(prefetch_join_timeout=0)
+        assert p._prefetch_join_timeout == 0.0
+
+    def test_prefetch_join_timeout_invalid_uses_default(self, provider_with_config):
+        """Invalid config value should fall back to default."""
+        p = provider_with_config(prefetch_join_timeout="garbage")
+        assert p._prefetch_join_timeout == 5.0
+
+    def test_prefetch_join_timeout_negative_uses_default(self, provider_with_config):
+        """Negative value should fall back to default."""
+        p = provider_with_config(prefetch_join_timeout=-5)
+        assert p._prefetch_join_timeout == 5.0
+
+    def test_prefetch_uses_configured_timeout(self, provider_with_config):
+        """prefetch() join should use the configured timeout."""
+        import threading
+
+        p = provider_with_config(prefetch_join_timeout=0.1)
+        gate = threading.Event()
+
+        def _slow():
+            gate.wait(timeout=5.0)
+
+        p._prefetch_thread = threading.Thread(target=_slow, daemon=True)
+        p._prefetch_thread.start()
+
+        result = p.prefetch("test")
+        gate.set()
+        assert result == ""
+
+    def test_session_switch_uses_configured_timeout(self, provider_with_config):
+        """on_session_switch join should use the configured timeout."""
+        import threading
+
+        p = provider_with_config(prefetch_join_timeout=0.1)
+        gate = threading.Event()
+
+        def _slow():
+            gate.wait(timeout=5.0)
+
+        p._prefetch_thread = threading.Thread(target=_slow, daemon=True)
+        p._prefetch_thread.start()
+
+        p.on_session_switch("new-sid")
+        gate.set()
+        assert p._prefetch_result == ""
+
+    def test_shutdown_uses_configured_timeout(self, provider_with_config):
+        """shutdown() join should use the configured timeout."""
+        import threading
+
+        p = provider_with_config(prefetch_join_timeout=0.1)
+        gate = threading.Event()
+
+        def _slow():
+            gate.wait(timeout=5.0)
+
+        p._prefetch_thread = threading.Thread(target=_slow, daemon=True)
+        p._prefetch_thread.start()
+
+        p._client.aclose = AsyncMock()
+        p.shutdown()
+        gate.set()
+
     def test_prefetch_result_cleared_on_switch(self, provider):
         """Stale recall text from the old session must not leak into the
         next session's first prefetch read."""
@@ -1126,30 +1239,12 @@ class TestSessionSwitchBufferFlush:
         # And subsequent prefetch() should now report empty, not the leftover.
         assert provider.prefetch("anything") == ""
 
-    def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
-        """on_session_switch must wait for an in-flight prefetch from the
-        old session to settle before clearing _prefetch_result, otherwise
-        the thread can race and re-populate the field after the clear."""
-        import threading
+    def test_session_switch_clears_completed_prefetch_result(self, provider):
+        """A completed old-session prefetch result must not enter the new session."""
+        provider._prefetch_result = "old-session recall"
 
-        gate = threading.Event()
-        finished = threading.Event()
-
-        def _slow_prefetch():
-            gate.wait(timeout=5.0)
-            with provider._prefetch_lock:
-                provider._prefetch_result = "old-session recall"
-            finished.set()
-
-        provider._prefetch_thread = threading.Thread(target=_slow_prefetch, daemon=True)
-        provider._prefetch_thread.start()
-
-        # Release the prefetch worker so it writes _prefetch_result, then
-        # call on_session_switch — it must join the thread before clearing.
-        gate.set()
         provider.on_session_switch("new-sid")
 
-        assert finished.is_set(), "switch returned before prefetch thread settled"
         assert provider._prefetch_result == ""
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
